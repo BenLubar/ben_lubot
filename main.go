@@ -15,6 +15,7 @@ import (
 
 var Client http.Client
 var MyID int
+var Subscribe = make(chan MessageBusSubscription)
 
 func init() {
 	blt := &ben_lubot_transport{base: http.DefaultTransport}
@@ -45,6 +46,7 @@ func (blt *ben_lubot_transport) RoundTrip(req *http.Request) (*http.Response, er
 		req.URL.RawQuery = q.Encode()
 	}
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	req.Header.Set("X-SILENCE-LOGGER", "true")
 	if blt.csrf != "" {
 		req.Header.Set("X-CSRF-Token", blt.csrf)
 	}
@@ -90,6 +92,21 @@ func PostJSON(path string, data url.Values) (v map[string]interface{}, err error
 	return
 }
 
+func PostArray(path string, data url.Values) (v []interface{}, err error) {
+	resp, err := Client.PostForm(Host+path, data)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+
+	err = json.NewDecoder(resp.Body).Decode(&v)
+	if err != nil {
+		return
+	}
+
+	return
+}
+
 func PostDiscard(path string, data url.Values) (err error) {
 	resp, err := Client.PostForm(Host+path, data)
 	if err != nil {
@@ -104,12 +121,12 @@ func PostDiscard(path string, data url.Values) (err error) {
 	return
 }
 
-func ReadTopic(id int) {
+func ReadTopic(id int) (posts int) {
 	s_id := strconv.Itoa(id)
 
 	add, last_read := "", 0
 	for {
-		topic, err := GetJSON("/t/" + s_id + ".json" + add)
+		topic, err := GetJSON("/t/" + s_id + ".json?track_visit=true" + add)
 		if err != nil {
 			panic(err)
 		}
@@ -134,7 +151,10 @@ func ReadTopic(id int) {
 			if !read {
 				pid := int(p.(map[string]interface{})["post_number"].(float64))
 				v["timings["+strconv.Itoa(pid)+"]"] = []string{n}
+
+				posts++
 				unread = true
+
 				if pid > last_read {
 					last_read = pid
 				}
@@ -148,22 +168,21 @@ func ReadTopic(id int) {
 			}
 		}
 
-		add = "?post_number=" + strconv.Itoa(last_read)
+		add = "&post_number=" + strconv.Itoa(last_read)
 	}
 }
 
-func BackfillLatest() {
-	url := "/latest.json"
+func getTopics(url string) (topics []int) {
 	for {
-		latest, err := GetJSON(url)
+		j, err := GetJSON(url)
 		if err != nil {
 			panic(err)
 		}
 
-		tl := latest["topic_list"].(map[string]interface{})
+		tl := j["topic_list"].(map[string]interface{})
 
 		for _, t := range tl["topics"].([]interface{}) {
-			ReadTopic(int(t.(map[string]interface{})["id"].(float64)))
+			topics = append(topics, int(t.(map[string]interface{})["id"].(float64)))
 		}
 
 		var ok bool
@@ -172,6 +191,26 @@ func BackfillLatest() {
 			return
 		}
 	}
+}
+
+func GetNewTopics() []int    { return getTopics("/new.json") }
+func GetUnreadTopics() []int { return getTopics("/unread.json") }
+func GetUnreadPrivateMessages() []int {
+	return getTopics("/topics/private-messages-unread/" + Username + ".json")
+}
+
+func Backfill(topics []int) {
+	log.Println("reading", len(topics), "topics")
+
+	posts := 0
+
+	for i, t := range topics {
+		p := ReadTopic(t)
+		posts += p
+		log.Printf("reading topics: %d/%d [%d/%d posts]", i+1, len(topics), p, posts)
+	}
+
+	log.Println("read", posts, "posts across", len(topics), "topics")
 }
 
 func Authenticate() {
@@ -185,5 +224,36 @@ func Authenticate() {
 
 func main() {
 	Authenticate()
-	BackfillLatest()
+
+	go MessageBus(Subscribe)
+
+	go func() {
+		for {
+			Backfill(GetNewTopics())
+			Backfill(GetUnreadTopics())
+			Backfill(GetUnreadPrivateMessages())
+
+			const naptime = time.Hour
+			log.Println("going to sleep until", time.Now().Add(naptime))
+			time.Sleep(naptime)
+		}
+	}()
+
+	go func() {
+		sub := func(channel string) {
+			Subscribe <- MessageBusSubscription{channel, func(data map[string]interface{}) {
+				log.Println("MESSAGE_BUS", channel, data)
+				if tid, ok := data["topic_id"]; ok {
+					id := int(tid.(float64))
+					log.Println("read", ReadTopic(id), "posts from topic", id, "(notifications"+channel+")")
+				}
+			}}
+		}
+		sub("/latest")
+		sub("/new")
+		sub("/unread/" + strconv.Itoa(MyID))
+		sub("/notification/" + strconv.Itoa(MyID))
+	}()
+
+	select {}
 }
