@@ -105,26 +105,48 @@ func PostDiscard(path string, data url.Values) (err error) {
 func ReadTopic(id int) {
 	s_id := strconv.Itoa(id)
 
-	topic, err := GetJSON("/t/" + s_id + ".json")
-	if err != nil {
-		panic(err)
-	}
-
-	n := strconv.Itoa(1000*60*3 + rand.Intn(100))
-	v := url.Values{
-		"topic_time": {n},
-		"topic_id":   {s_id},
-	}
-	for _, p := range topic["post_stream"].(map[string]interface{})["posts"].([]interface{}) {
-		read, _ := p.(map[string]interface{})["read"].(bool)
-		if !read {
-			v["timings["+strconv.Itoa(int(p.(map[string]interface{})["post_number"].(float64)))+"]"] = []string{n}
+	add, last_read := "", 0
+	for {
+		topic, err := GetJSON("/t/" + s_id + ".json" + add)
+		if err != nil {
+			panic(err)
 		}
-	}
 
-	err = PostDiscard("/topics/timings", v)
-	if err != nil {
-		panic(err)
+		lrf, _ := topic["last_read_post_number"].(float64)
+		lr := int(lrf)
+		if lr >= int(topic["posts_count"].(float64)) {
+			return
+		}
+		if lr > last_read {
+			last_read = lr
+		}
+
+		n := strconv.Itoa(1000*60*3 + rand.Intn(100))
+		v := url.Values{
+			"topic_time": {n},
+			"topic_id":   {s_id},
+		}
+		unread := false
+		for _, p := range topic["post_stream"].(map[string]interface{})["posts"].([]interface{}) {
+			read, _ := p.(map[string]interface{})["read"].(bool)
+			if !read {
+				pid := int(p.(map[string]interface{})["post_number"].(float64))
+				v["timings["+strconv.Itoa(pid)+"]"] = []string{n}
+				unread = true
+				if pid > last_read {
+					last_read = pid
+				}
+			}
+		}
+
+		if unread {
+			err = PostDiscard("/topics/timings", v)
+			if err != nil {
+				panic(err)
+			}
+		}
+
+		add = "?post_number=" + strconv.Itoa(last_read)
 	}
 }
 
