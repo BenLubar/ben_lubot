@@ -53,9 +53,11 @@ func (blt *ben_lubot_transport) RoundTrip(req *http.Request) (*http.Response, er
 	time.Sleep(time.Second)
 	blt.wait.Unlock()
 
-	log.Println(req)
+	start := time.Now()
+	resp, err := blt.base.RoundTrip(req)
+	log.Println(req.Method, req.URL.RequestURI(), time.Since(start))
 
-	return blt.base.RoundTrip(req)
+	return resp, err
 }
 
 func GetJSON(path string) (v map[string]interface{}, err error) {
