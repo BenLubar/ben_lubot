@@ -124,73 +124,82 @@ func PostDiscard(path string, data url.Values) (err error) {
 func ReadTopic(id int) (posts int) {
 	s_id := strconv.Itoa(id)
 
-	add, last_read := "", 0
-	for {
-		topic, err := GetJSON("/t/" + s_id + ".json?track_visit=true" + add)
-		if err != nil {
-			panic(err)
-		}
-
-		lrf, _ := topic["last_read_post_number"].(float64)
-		lr := int(lrf)
-		if lr >= int(topic["posts_count"].(float64)) {
-			return
-		}
-		if lr > last_read {
-			last_read = lr
-		}
-
-		n := strconv.Itoa(1000*60*3 + rand.Intn(100))
-		v := url.Values{
-			"topic_time": {n},
-			"topic_id":   {s_id},
-		}
-		unread := false
-		for _, p := range topic["post_stream"].(map[string]interface{})["posts"].([]interface{}) {
-			read, _ := p.(map[string]interface{})["read"].(bool)
-			if !read {
-				pid := int(p.(map[string]interface{})["post_number"].(float64))
-				v["timings["+strconv.Itoa(pid)+"]"] = []string{n}
-
-				posts++
-				unread = true
-
-				if pid > last_read {
-					last_read = pid
-				}
-			}
-		}
-
-		if unread {
-			err = PostDiscard("/topics/timings", v)
+	TryTryAgain("reading topic "+s_id, func() {
+		posts = 0
+		add, last_read := "", 0
+		for {
+			topic, err := GetJSON("/t/" + s_id + ".json?track_visit=true" + add)
 			if err != nil {
 				panic(err)
 			}
-		}
 
-		add = "&post_number=" + strconv.Itoa(last_read)
-	}
+			lrf, _ := topic["last_read_post_number"].(float64)
+			lr := int(lrf)
+			if lr >= int(topic["posts_count"].(float64)) {
+				return
+			}
+			if lr > last_read {
+				last_read = lr
+			}
+
+			n := strconv.Itoa(1000*60*3 + rand.Intn(100))
+			v := url.Values{
+				"topic_time": {n},
+				"topic_id":   {s_id},
+			}
+			unread := false
+			for _, p := range topic["post_stream"].(map[string]interface{})["posts"].([]interface{}) {
+				read, _ := p.(map[string]interface{})["read"].(bool)
+				if !read {
+					pid := int(p.(map[string]interface{})["post_number"].(float64))
+					v["timings["+strconv.Itoa(pid)+"]"] = []string{n}
+
+					posts++
+					unread = true
+
+					if pid > last_read {
+						last_read = pid
+					}
+				}
+			}
+
+			if unread {
+				err = PostDiscard("/topics/timings", v)
+				if err != nil {
+					panic(err)
+				}
+			}
+
+			add = "&post_number=" + strconv.Itoa(last_read)
+		}
+	})
+	return
 }
 
-func getTopics(url string) (topics []int) {
-	for {
-		j, err := GetJSON(url)
-		if err != nil {
-			panic(err)
-		}
+func getTopics(base_url string) (topics []int) {
+	TryTryAgain("getting topics from "+base_url, func() {
+		url := base_url
+		topics = nil
+		for {
+			j, err := GetJSON(url)
+			if err != nil {
+				panic(err)
+			}
 
-		tl := j["topic_list"].(map[string]interface{})
+			tl := j["topic_list"].(map[string]interface{})
 
-		for _, t := range tl["topics"].([]interface{}) {
-			topics = append(topics, int(t.(map[string]interface{})["id"].(float64)))
-		}
+			for _, t := range tl["topics"].([]interface{}) {
+				topics = append(topics, int(t.(map[string]interface{})["id"].(float64)))
+			}
 
-		var ok bool
-		url, ok = tl["more_topics_url"].(string)
-		if !ok {
-			return
+			var ok bool
+			url, ok = tl["more_topics_url"].(string)
+			if !ok {
+				return
+			}
 		}
-	}
+	})
+	return
 }
 
 func GetNewTopics() []int    { return getTopics("/new.json") }
@@ -222,8 +231,29 @@ func Authenticate() {
 	MyID = int(v["user"].(map[string]interface{})["id"].(float64))
 }
 
+func TryTryAgain(name string, f func()) {
+	back_off := time.Second
+	for {
+		if func() bool {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Println(name, "encountered error:", r)
+					log.Println("retrying in", back_off)
+					time.Sleep(back_off)
+					back_off *= 2
+				}
+			}()
+
+			f()
+			return true
+		}() {
+			break
+		}
+	}
+}
+
 func main() {
-	Authenticate()
+	Authenticate() // if this fails, we crash. don't try again as it is only done at startup.
 
 	go MessageBus(Subscribe)
 
@@ -242,6 +272,13 @@ func main() {
 	go func() {
 		sub := func(channel string) {
 			Subscribe <- MessageBusSubscription{channel, func(data map[string]interface{}) {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Println("error in subscription callback:", r)
+						// don't retry
+					}
+				}()
+
 				log.Println("MESSAGE_BUS", channel, data)
 				if tid, ok := data["topic_id"]; ok {
 					id := int(tid.(float64))
@@ -250,8 +287,6 @@ func main() {
 			}}
 		}
 		sub("/latest")
-		sub("/new")
-		sub("/unread/" + strconv.Itoa(MyID))
 		sub("/notification/" + strconv.Itoa(MyID))
 	}()
 
